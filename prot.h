@@ -6,7 +6,7 @@
 #define SUDP_PACK_TRUNC 1000
 #define SUDP_WINDOW_SIZE 10
 #define SUDP_RESEND_INTERVAL 5000 // unit:ms
-#define SUDP_SENDCHECK_INTERVAL 10000 // unit:us
+#define SUDP_SENDCHECK_INTERVAL 1000 // unit:us
 
 void sudp_init();
 qSocket sudp_open();

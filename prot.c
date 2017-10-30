@@ -3,6 +3,8 @@
 #include "zhwkre/list.h"
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
+#include <stdio.h>
 
 typedef unsigned int ui;
 
@@ -19,6 +21,8 @@ int checkno;
 ui timerv;
 ui timer;
 ui connect_stat;
+ui allpacklen;
+qSocket tempsock;// i have to put it somewhere to not be freed so quickly
 
 #define PTR(x) ((void*)&(x))
 #define ZEROINIT(x) memset(&(x),0,sizeof(x))
@@ -38,6 +42,10 @@ void* sudp_timer(void* fakeargs){
     while(timer){
         usleep(1000);
         timerv++;
+        if(timerv % 1000 == 0){
+            printf("%d bytes/s\n",allpacklen);
+            allpacklen = 0;
+        }
     }
     return NULL;
 }
@@ -94,6 +102,7 @@ void* sudp_receiver(void* q_sock){
                                     ack.operid = SUDP_ACK;
                                     ack.serino = dat->serino;
                                     qDatagramSocket_send(sock,connectedaddr,PTR(ack),sizeof(ack),0);
+                                    //printf("receiver acked %d\n",ack.serino);
                                     break;
                                 }
                             }
@@ -111,10 +120,10 @@ void* sudp_receiver(void* q_sock){
                             qDatagramSocket_send(sock,connectedaddr,PTR(bad),sizeof(bad),0);
                         }else if(dat->serino > recvseri_top){
                             // then this can be stretched properly.
+                            sudp_datapack_stat* curr_pack = NULL;
+                            int curr_seri = recvseri_top;
                             recvseri_top = dat->serino;
-                            sudp_datapack_stat* curr_pack = (sudp_datapack_stat*)succ_recv.tail->data;
-                            int curr_seri = curr_pack->serino;
-                            for(int i=curr_seri;i<=recvseri_top;i++){
+                            for(int i=curr_seri+1;i<=recvseri_top;i++){
                                 sudp_datapack_stat tmppack;
                                 ZEROINIT(tmppack);
                                 tmppack.serino = i;
@@ -131,6 +140,7 @@ void* sudp_receiver(void* q_sock){
                             ack.operid = SUDP_ACK;
                             ack.serino = dat->serino;
                             qDatagramSocket_send(sock,connectedaddr,PTR(ack),sizeof(ack),0);
+                            //printf("receiver acked %d\n",ack.serino);
                         }else if(dat->serino < recvseri_bottom){
                             // ignore
                             recvmu.unlock(recvmu);
@@ -151,6 +161,7 @@ void* sudp_receiver(void* q_sock){
                                     ack.operid = SUDP_ACK;
                                     ack.serino = dat->serino;
                                     qDatagramSocket_send(sock,connectedaddr,PTR(ack),sizeof(ack),0);
+                                    //printf("receiver acked %d\n",ack.serino);
                                     break;
                                 }
                             }
@@ -173,6 +184,7 @@ void* sudp_receiver(void* q_sock){
                         sudp_datapack_stat* pack = (sudp_datapack_stat*)iter->data;
                         if(pack->serino == ack->serino){
                             pack->status = SUDP_PACK_ACKED;
+                            //printf("receiver successfully acked %d\n",ack->serino);
                             break;
                         }
                     }
@@ -222,12 +234,21 @@ void* sudp_sender(void* q_sock){
         // remove acked packages to allow window shrink
         sendmu.lock(sendmu);
         qListIterator iter = succ_sent.head;
+        if(iter == NULL){
+            sendmu.unlock(sendmu);
+            continue;
+        }
         sudp_datapack_stat* dpiter = iter->data;
         while(dpiter->status == SUDP_PACK_ACKED){
             qListIterator tmpnext = iter->next;
+            sendseri_bottom = dpiter->serino+1; // shrink window
             qList_erase_elem(succ_sent,iter);
             iter=tmpnext;
-            dpiter=iter->data;
+            if(iter != NULL){
+                dpiter=iter->data;
+            }else{
+                break;
+            }
         }
         // check all packages in the window: wait send to sent,too long reset
         qList_foreach(succ_sent,riter){
@@ -243,6 +264,8 @@ void* sudp_sender(void* q_sock){
                 memcpy(buffer,&dat,sizeof(dat));
                 memcpy(buffer+sizeof(dat),pack->content,pack->size);
                 qDatagramSocket_send(sock,connectedaddr,buffer,pack->size+sizeof(dat),0);
+                //printf("sender sent seri %d\n",pack->serino);
+                pack->status = SUDP_PACK_SENT;
                 pack->init_time = timerv;
             }else if(pack->status == SUDP_PACK_SENT){
                 // check timeout
@@ -262,15 +285,20 @@ void* sudp_sender(void* q_sock){
 void sudp_init(){
     qList_initdesc(succ_sent);
     qList_initdesc(succ_recv);
-    qMutex_constructor(sendmu);
-    qMutex_constructor(recvmu);
+    // put a no.0 pack in succ_recv to correctly handle the first package
+    sudp_datapack_stat fakepack;
+    ZEROINIT(fakepack);
+    fakepack.status = SUDP_PACK_TAKEPLACE;
+    qList_push_back(succ_recv,fakepack);
+    sendmu=qMutex_constructor();
+    recvmu=qMutex_constructor();
     timer=1;
     qRun(sudp_timer,NULL);
     // int values are automatically set to 0 -- glob vars
 }
 
 qSocket sudp_open(){
-    qSocket sock = qSocket_constructor(qIPv4,qDefaultProto,qDatagramSocket);
+    qSocket sock = qSocket_constructor(qIPv4,qDatagramSocket,qDefaultProto);
     qSocket_open(sock);
     return sock;
 }
@@ -317,8 +345,10 @@ int sudp_accept(qSocket sock){
         }
         // ack success. connection established.
         // start receiver and sender
-        qRun(sudp_receiver,&sock);
-        qRun(sudp_sender,&sock);
+        connect_stat = 1;
+        tempsock = sock;
+        qRun(sudp_receiver,&tempsock);
+        qRun(sudp_sender,&tempsock);
     }
     return 0;
 }
@@ -332,7 +362,9 @@ int sudp_connect(qSocket sock,const char* addrxport){
     ZEROINIT(syn);
     syn.operid = SUDP_SYN;
     syn.checkno = 233;
-    if(qDatagramSocket_send(sock,addrxport,PTR(syn),sizeof(syn),0)!=sizeof(syn)){
+    int senderrn = qDatagramSocket_send(sock,addrxport,PTR(syn),sizeof(syn),0);
+    if(senderrn!=sizeof(syn)){
+        //printf("send failed errno %d,errn %d, synsize %d\n",errno,senderrn,(int)sizeof(syn));
         return -1;
     }
     // wait ack
@@ -360,8 +392,10 @@ int sudp_connect(qSocket sock,const char* addrxport){
         }
     }
     // successive
-    qRun(sudp_receiver,&sock);
-    qRun(sudp_sender,&sock);
+    connect_stat = 1;
+    tempsock = sock;
+    qRun(sudp_receiver,&tempsock);
+    qRun(sudp_sender,&tempsock);
     return 0;
 }
 
@@ -371,7 +405,6 @@ int sudp_send(qSocket sock,const char* payload,int length){
     sendmu.lock(sendmu);
     int curr_pos = 0;
     while(curr_pos != length){
-        sendseri_top++;
         sudp_datapack_stat pack;
         ZEROINIT(pack);
         pack.serino = sendseri_top;
@@ -386,16 +419,29 @@ int sudp_send(qSocket sock,const char* payload,int length){
             curr_pos+=1000;
         }
         qList_push_back(succ_sent,pack);
+        sendseri_top++;
     }
     sendmu.unlock(sendmu);
     return length;
 }
 
 int sudp_recv(qSocket sock,char* buffer,int limit){
-    while(1){
+    // the double while loop cause very serious sync problem
+    /*while(succ_recv.head == NULL);
+    sudp_datapack_stat *tstpack = succ_recv.head->data;
+    while(tstpack->status != SUDP_PACK_ACKED && connect_stat){
+        qList_foreach(succ_recv,it){
+            sudp_datapack_stat* tmpdbg = it->data;
+            //printf("%d-%d\n",tmpdbg->serino,tmpdbg->status);
+        }
+        usleep(100000);
+    }*/
+    while(connect_stat){
+        if(succ_recv.head == NULL) continue;
         sudp_datapack_stat *tstpack = succ_recv.head->data;
-        while(tstpack != NULL && tstpack->status != SUDP_PACK_ACKED && connect_stat);
-        if(tstpack != NULL) break;
+        if(tstpack == NULL) continue;
+        if(tstpack->status != SUDP_PACK_ACKED) continue;
+        break;
     }
     if(!connect_stat) return 0;
     recvmu.lock(recvmu);
@@ -430,11 +476,19 @@ int sudp_recv(qSocket sock,char* buffer,int limit){
     sudp_datapack_stat* dpiter = iter->data;
     while(dpiter->status == SUDP_PACK_USED){
         qListIterator tmpnext = iter->next;
+        // shrink window
+        recvseri_bottom = dpiter->serino+1;
+        //printf("receive buffer clear %d\n",recvseri_bottom);
         qList_erase_elem(succ_recv,iter);
         iter=tmpnext;
-        dpiter=iter->data;
+        if(iter!=NULL){
+            dpiter=iter->data;
+        }else{
+            break;
+        }
     }
     // unlock
     recvmu.unlock(recvmu);
+    allpacklen += received;
     return received;
 }
